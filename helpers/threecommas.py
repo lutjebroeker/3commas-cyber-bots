@@ -394,3 +394,26 @@ def get_threecommas_deals(logger, api, botid):
         logger.info("Fetched the deals for bot OK (%s deals)" % len(data))
 
     return data
+
+def get_threecommas_botinfo(logger, api, botid):
+    """Get all botinfo from 3Commas linked to a bot."""
+
+    data = None
+    error, data = api.request(
+        entity="bots",
+        action="show",
+        action_id=str(botid),
+        payload={
+        },
+    )
+    if error:
+        if "msg" in error:
+            logger.error(
+                "Error occurred while fetching bot information error: %s" % error["msg"],
+            )
+        else:
+            logger.error("Error occurred while fetching bot information")
+    else:
+        logger.info("Fetched the information for bot OK %s" % len(data))
+
+    return data
