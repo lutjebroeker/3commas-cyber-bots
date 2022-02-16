@@ -8,10 +8,11 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+from unittest import expectedFailure
 
 from helpers.logging import Logger, NotificationHandler
 from helpers.misc import check_deal, wait_time_interval
-from helpers.threecommas import init_threecommas_api
+from helpers.threecommas import init_threecommas_api , get_threecommas_botinfo
 
 
 def load_config():
@@ -29,11 +30,14 @@ def load_config():
         "botids": [12345, 67890],
         "activation-percentage": 0,
         "initial-stoploss-percentage": "[]",
+        "max_safety_orders": 5,
         "3c-apikey": "Your 3Commas API Key",
         "3c-apisecret": "Your 3Commas API Secret",
         "notifications": False,
         "notify-urls": ["notify-url1"],
     }
+
+    
 
     with open(f"{datadir}/{program}.ini", "w") as cfgfile:
         cfg.write(cfgfile)
@@ -53,7 +57,18 @@ def upgrade_config(thelogger, cfg):
 
         thelogger.info("Upgraded the configuration file")
 
+    try:
+        cfg.get("settings", "max_safety_orders")
+    except configparser.NoOptionError:
+        cfg.set("settings", "max_safety_orders", "[]")
+        with open(f"{datadir}/{program}.ini", "w+") as cfgfile:
+            cfg.write(cfgfile)
+
+        thelogger.info("Upgraded the configuration file")
+
     return cfg
+
+
 
 
 def update_deal(thebot, deal, new_stoploss):
@@ -85,6 +100,28 @@ def update_deal(thebot, deal, new_stoploss):
         else:
             logger.error("Error occurred updating bot with new take profit values")
 
+class SafetyOrder:
+  def __init__(safetyorder, volume, buy_price):
+    safetyorder.volume = volume
+    safetyorder.buy_price = buy_price
+
+def calculate_next_safety_order_values(safety_order_volume, safety_order_step_percentage, martingale_volume_coefficient, martingale_step_coefficient,  deal, safety_order_step):
+    #Calculate Safety order size 
+    NextSO_volume = float(safety_order_volume)
+    NextSO_Percentage_Drop_From_BO_Buy_Price = float(safety_order_step_percentage)
+    NextSO_buy_price = float(deal["base_order_average_price"])  * (100 - NextSO_Percentage_Drop_From_BO_Buy_Price)
+    
+    if safety_order_step > 1:
+        i = 1
+        NextSO_volume = safety_order_volume
+        NextSO_Percentage_Drop_From_BO_Buy_Price = float(safety_order_step_percentage)
+
+        while i <= safety_order_step:
+            NextSO_volume = float(NextSO_volume) * float(martingale_volume_coefficient)
+            NextSO_Percentage_Drop_From_BO_Buy_Price = float(NextSO_Percentage_Drop_From_BO_Buy_Price) * float(martingale_step_coefficient)
+            NextSO_buy_price = float(deal["base_order_average_price"])  * float((100 - NextSO_Percentage_Drop_From_BO_Buy_Price))
+            i += 1
+    return SafetyOrder(NextSO_volume, NextSO_buy_price)
 
 def trailing_stoploss(thebot):
     """Check deals from bot and compare SL against the database."""
@@ -92,13 +129,33 @@ def trailing_stoploss(thebot):
     deals_count = 0
     deals = thebot["active_deals"]
 
-    logger.info(f"Activation: {activation_percentage}%")
+    #logger.info(f"Activation: {thebot["safety_order_step_percentage"]}%")
     logger.info(f"Set stoploss % value @ activation: {initial_stoploss_percentage}")
 
     if deals:
         for deal in deals:
             deals_count += 1
 
+            current_safety_order_step = 1
+
+            nextSafetyOrder = calculate_next_safety_order_values(
+                thebot["safety_order_volume"] ,  #Safety order size
+                thebot["safety_order_step_percentage"], #Price deviation to open safety orders (% from initial order)
+                thebot["martingale_volume_coefficient"], #Safety order volume scale
+                thebot["martingale_step_coefficient"], #Safety order step scale
+                deal,
+                current_safety_order_step
+                )
+        
+            trailingSafetyOrder = calculate_next_safety_order_values(
+                thebot["safety_order_volume"] ,  #Safety order size
+                thebot["safety_order_step_percentage"], #Price deviation to open safety orders (% from initial order)
+                thebot["martingale_volume_coefficient"], #Safety order volume scale
+                thebot["martingale_step_coefficient"], #Safety order step scale
+                deal,
+                current_safety_order_step + 1
+                )
+            
             sl_price = float(
                 (0 if deal["stop_loss_price"] is None else deal["stop_loss_price"])
             )
@@ -186,12 +243,11 @@ def init_tsl_db():
         logger.info(f"Database '{datadir}/{dbname}' created successfully")
 
         dbcursor.execute(
-            "CREATE TABLE deals (dealid INT Primary Key, last_profit_percentage FLOAT, last_stop_loss_percentage FLOAT)"
+            "CREATE TABLE deals (dealid INT Primary Key, last_profit_percentage FLOAT, last_stop_loss_percentage FLOAT, completed_safety_orders_count INT)"
         )
         logger.info("Database tables created successfully")
 
     return dbconnection
-
 
 # Start application
 program = Path(__file__).stem
@@ -266,6 +322,10 @@ while True:
         config.get("settings", "initial-stoploss-percentage")
     )
 
+    max_safety_orders = json.loads(
+        config.get("settings", "max_safety_orders")
+    )
+
     # Walk through all bots configured
     for bot in botids:
         boterror, botdata = api.request(
@@ -274,7 +334,7 @@ while True:
             action_id=str(bot),
         )
         if botdata:
-            trailing_stoploss(botdata)
+            trailing_stoploss(botdata)           
         else:
             if boterror and "msg" in boterror:
                 logger.error("Error occurred updating bots: %s" % boterror["msg"])
